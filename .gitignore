@@ -1,0 +1,18 @@
+# .gitignore
+# Binaries
+/xdp-lb
+
+# eBPF compiled objects and generated Go bindings
+*.o
+*.ll
+bpf_bpfeb.go
+bpf_bpfel.go
+bpf_bpfeb.o
+bpf_bpfel.o
+
+# IDEs
+.vscode/
+.idea/
+
+# OS specific
+.DS_Store
