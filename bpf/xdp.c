@@ -4,6 +4,8 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/in.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
 #include <bpf/bpf_helpers.h>
 
 #include "maps.h"
