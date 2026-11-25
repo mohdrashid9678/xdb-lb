@@ -1,20 +1,19 @@
-CLANG ?= clang
-CFLAGS := -O2 -g -Wall -Werror $(CFLAGS)
-
-all: generate build
+all: build
 
 generate:
 	@echo "=> Generating eBPF Go bindings..."
-	# Run go generate on the ebpf package
 	go generate ./pkg/ebpf/...
 
 build: generate
 	@echo "=> Building Go control plane..."
 	go build -o xdp-lb ./cmd
 
+test: generate
+	go test ./...
+
 clean:
 	@echo "=> Cleaning up..."
 	rm -f xdp-lb
 	rm -f pkg/ebpf/bpf_bpfel.go pkg/ebpf/bpf_bpfeb.go pkg/ebpf/bpf_bpfel.o pkg/ebpf/bpf_bpfeb.o
 
-.PHONY: all generate build clean
+.PHONY: all generate build test clean
