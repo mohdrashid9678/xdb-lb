@@ -50,7 +50,7 @@ int xdp_load_balancer(struct xdp_md *ctx) {
     }
 
     if (debug_enabled) {
-        bpf_printk("xdp-lb: hash=%u src=%pI4:%d -> backend=%pI4",
+        bpf_printk("TCP Conntrack -> Hash: %u | SRC: %pI4:%d -> Target: %pI4\n",
                    hash, &iph->saddr, bpf_ntohs(tcph->source), target_ip);
     }
 
