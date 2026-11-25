@@ -1,48 +1,59 @@
 package main
 
 import (
+	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
 	"github.com/mohdrashid9678/xdb-lb/pkg/config"
 	"github.com/mohdrashid9678/xdb-lb/pkg/ebpf"
 	"github.com/mohdrashid9678/xdb-lb/pkg/telemetry"
 )
 
 func main() {
-	// Load Configuration
-	cfg, err := config.Load("config.json")
-	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
-	}
+	configPath := flag.String("config", "config.json", "path to the JSON configuration file")
+	debug := flag.Bool("debug", false, "trace every packet to /sys/kernel/debug/tracing/trace_pipe (slow; never use under load)")
+	flag.Parse()
 
-	if len(cfg.Backends) == 0 {
-		log.Fatalf("No backends defined in configuration")
+	if err := run(*configPath, *debug); err != nil {
+		log.Fatal(err)
 	}
+}
 
-	// Initialize eBPF Engine
-	engine, err := ebpf.NewEngine(cfg.Backends)
+// run holds the program's lifetime so that deferred cleanup (detaching the
+// XDP program) always executes; log.Fatal in main would skip it.
+func run(configPath string, debug bool) error {
+	cfg, err := config.Load(configPath)
 	if err != nil {
-		log.Fatalf("Failed to initialize eBPF engine: %v", err)
+		return fmt.Errorf("load config: %w", err)
+	}
+	backends := cfg.BackendAddrs()
+
+	engine, err := ebpf.NewEngine(backends, ebpf.Options{Debug: debug})
+	if err != nil {
+		return fmt.Errorf("initialize eBPF engine: %w", err)
 	}
 	defer engine.Close()
 
-	// Attach to Network Interface
 	if err := engine.Attach(cfg.Interface); err != nil {
-		log.Fatalf("Failed to attach to interface %s: %v", cfg.Interface, err)
+		return fmt.Errorf("attach to interface %s: %w", cfg.Interface, err)
 	}
 	log.Printf("XDP L4 Balancer attached to %s", cfg.Interface)
-	log.Printf("Routing traffic across %d backends via Consistent Hashing", len(cfg.Backends))
+	log.Printf("Hashing TCP flows across %d backends", len(backends))
+	if debug {
+		log.Printf("Debug tracing ON: per-packet output in /sys/kernel/debug/tracing/trace_pipe")
+	}
 
-	// Start Telemetry
-	telemetry.StartPolling(engine.GetStatsMap(), cfg.Backends, 3*time.Second)
+	telemetry.StartPolling(engine.GetStatsMap(), backends, 3*time.Second)
 
-	// Wait for Shutdown Signal
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 	<-stopper
 
 	log.Println("Detaching XDP program and shutting down...")
+	return nil
 }

@@ -2,16 +2,41 @@
 
 This is a from-scratch, kernel-level Layer 4 load balancer built to explore how hyperscale network systems route millions of packets per second. By leveraging **eBPF** and **XDP (eXpress Data Path)**, this project drops the heavy overhead of the standard Linux networking stack, intercepting and routing packets directly inside the Network Interface Card (NIC) driver.
 
+> **Status: work in progress.** Today the program parses, hashes and counts every IPv4 TCP packet on the interface, then passes it to the local stack unchanged. **It does not forward traffic to backends yet.** Forwarding, real consistent hashing, health checks and metrics are being added phase by phase; see the [roadmap](docs/README.md) and the per-phase notes in [`docs/`](docs/).
+
 ## Architecture
 The system is divided into two distinct decoupled layers:
 
 * **The Data Plane (C):** A C program compiled to eBPF bytecode. It runs in the kernel, parsing raw Ethernet/IP/TCP memory structures, calculates hash on the network 5-tuple, and looking up routing decisions in $O(1)$ time.
 * **The Control Plane (Go):** A user-space daemon built with `cilium/ebpf`. It autonomously detects active network interfaces, loads configurations, and orchestrates the kernel via shared eBPF Maps.
 
-## ✨ Core Features
-* **TCP Stickiness:** Uses a 5-Tuple (Src IP, Dst IP, Src Port, Dst Port, Protocol) Hash against a consistent hashing ring to guarantee TCP handshake integrity.
-* **Kernel-Space to User-Space Telemetry:** Live traffic metrics are aggregated in kernel memory and polled asynchronously by Go.
-* **Dynamic Auto-Configuration:** Reads backend pools from JSON and uses UDP dialing to autonomously detect the primary active host network interface.
+## ✨ What Works Today
+* **Flow-stable backend selection:** Hashes the 5-Tuple (Src IP, Dst IP, Src Port, Dst Port, Protocol) onto a 251-slot ring, so every packet of a TCP connection selects the same backend. The ring is currently filled with `slot % backends`; Maglev consistent hashing replaces it in phase 3.
+* **Kernel-Space to User-Space Telemetry:** Per-backend packet counters are kept in kernel memory and polled asynchronously by Go.
+* **Validated configuration:** Reads backend pools from JSON and reports every problem in the file at once (invalid, duplicate or non-IPv4 addresses, unknown keys, missing interface) before touching the kernel.
+* **Zero-cost debug tracing:** Per-packet tracing is compiled in but removed by the verifier unless you start with `-debug`.
+
+## Requirements
+* Linux **5.9+** (XDP attach via `bpf_link`). `-debug` tracing needs **5.16+**.
+* Go **1.24+**, clang/LLVM, libbpf headers.
+* Root, or `CAP_BPF` + `CAP_NET_ADMIN`.
+
+## Configuration
+```json
+{
+    "interface": "veth-host",
+    "backends": ["192.168.1.100", "192.168.1.101", "192.168.1.102"]
+}
+```
+| Key | Meaning |
+| --- | --- |
+| `interface` | Interface to attach to. `"auto"` (or empty) picks the interface that carries the default route, which is usually your primary NIC, so prefer an explicit name. |
+| `backends` | 1 to 10 unique IPv4 addresses. |
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-config` | `config.json` | Path to the configuration file. |
+| `-debug` | off | Trace every packet to the kernel trace pipe. Roughly 20x slower per packet; never use under load. |
 
 ## How to Run and Test
 
@@ -19,8 +44,9 @@ The system is divided into two distinct decoupled layers:
 You need a Linux environment with the eBPF toolchain installed:
 ```bash
 sudo apt update
-sudo apt install -y clang llvm libbpf-dev linux-headers-generic iproute2
+sudo apt install -y clang llvm libbpf-dev linux-headers-generic iproute2 netcat-openbsd
 ```
+You also need Go 1.24 or newer.
 
 ### 2. Build the Project
 The Makefile automatically generates the Go bindings from the C code and compiles the engine.
@@ -42,10 +68,10 @@ sudo ip netns exec xdp-test ip link set lo up
 ```
 
 ### 4. Execute
-Make sure your `config.json` interface is set to `veth-host` or `auto`.
-Run the Go daemon (Terminal 1):
+Make sure your `config.json` interface is set to `veth-host`.
+Run the Go daemon (Terminal 1). `-debug` turns on the per-packet trace used in the next step:
 ```bash
-sudo ./xdp-lb
+sudo ./xdp-lb -config config.json -debug
 ```
 ![Screenshot](assets/telemetry.png)
 
@@ -58,21 +84,41 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe
 
 
 ### 5. Check TCP Stickiness
-Fire traffic from the namespace (Terminal 3) by the same host and port.
+Fire traffic from the namespace (Terminal 3). The same source port always selects the same backend in the trace. Nothing listens on port 80, so `nc` reports "connection refused"; the SYN is still hashed and counted.
 ```bash
-# Simulating Client A (Should consistently hit Backend X)
+# Simulating Client A (Should consistently select Backend X)
 sudo ip netns exec xdp-test nc -p 55555 -zv 10.0.0.1 80
 
-# Simulating Client B (Should consistently hit Backend Y)
-sudo ip netns exec xdp-test nc -p 66666 -zv 10.0.0.1 80
+# Simulating Client B (Should consistently select Backend Y)
+sudo ip netns exec xdp-test nc -p 44444 -zv 10.0.0.1 80
 ```
 
-## Future Roadmap
-* **Packet Mutation (XDP_TX):** Implement MAC address rewriting and IPIP encapsulation to achieve Direct Server Return (DSR), allowing the LB to forward packets out to physical hardware.
-* **Active Health Checks:** Add a background worker in the Go control plane to ping backend servers and dynamically prune the Consistent Hashing Ring if a node dies.
-* **LRU Connection Cache:** Implement a Least Recently Used (LRU) eBPF Map to handle IP fragmentation and graceful backend draining.
+### 6. Tear Down
+Stop the daemon with Ctrl-C (this detaches the XDP program), then remove the testbed:
+```bash
+sudo ip netns del xdp-test
+sudo ip link del veth-host
+```
+
+### Run the Tests
+```bash
+make test
+```
+
+## Roadmap
+The plan, the status of each phase and the concepts and decisions behind every change live in [`docs/`](docs/README.md).
+
+| Phase | Goal |
+| --- | --- |
+| 0. Clean up | Honest README, strict build, validated config, tracing off by default |
+| 1. Safety net | Packet-level tests, per-packet benchmarks, CI |
+| 2. Balance for real | Virtual services and packet forwarding (`XDP_TX`) |
+| 3. Balance well | Maglev hashing, connection table, health checks, live reload |
+| 4. Operate it | Per-CPU metrics, hitless restart, packaging |
+| 5. Extend | IPIP, IPv6, UDP, VLAN, published benchmarks |
 
 ## Author
 **Mohd Rashid** - [@mohdrashid9678](https://github.com/mohdrashid9678)
 
-# Contributions are always welcomed. Just create an issue, and raise a PR against the issue.
+## Contributing
+Contributions are always welcome. Create an issue, then raise a PR against it.
